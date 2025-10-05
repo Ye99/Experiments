@@ -1,0 +1,13 @@
+# Training outputs
+/distilbert-base-uncased-finetuned-emotion/
+**/checkpoint-*/
+# HF caches and datasets
+~/.cache/huggingface/
+~/.cache/hf/
+# TensorBoard logs
+**/events.out.tfevents.*
+# Python/byproducts
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/

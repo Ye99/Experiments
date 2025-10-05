@@ -83,6 +83,20 @@ def parse_args() -> argparse.Namespace:
         print("Warning: --fp16 requested but CUDA is not available; disabling fp16.", file=sys.stderr)
         args.fp16 = False
 
+    # Auto-select mixed precision on GPU when user did not request either
+    if torch.cuda.is_available():
+        if not args.fp16 and not args.bf16:
+            try:
+                if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                    args.bf16 = True
+                else:
+                    args.fp16 = True
+            except Exception:
+                args.fp16 = True
+    else:
+        args.fp16 = False
+        args.bf16 = False
+
     return args
 
 
@@ -111,6 +125,10 @@ def main():
 
     # Reproducibility
     set_seed(args.seed)
+
+    device = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+    precision = "bf16" if args.bf16 else ("fp16" if args.fp16 else "fp32")
+    print(f"Device: {device} | Precision: {precision}")
 
     # 1) Load dataset
     print(f"Loading dataset: {args.dataset}")
@@ -170,7 +188,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
-        evaluation_strategy=args.eval_strategy,
+        eval_strategy=args.eval_strategy,
         logging_steps=logging_steps,
         save_strategy="epoch" if args.eval_strategy == "epoch" else "steps",
         load_best_model_at_end=(args.eval_strategy != "no"),
