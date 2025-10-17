@@ -10,10 +10,10 @@ It:
 - Saves the model, tokenizer, and optionally pushes to the Hub
 
 Example:
-  python fine_tune_transformers.py --epochs 2 --batch_size 64 --lr 2e-5 --output_dir runs/distilbert-emotion
+  python fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64 --lr 2e-5 --output_dir runs/distilbert-emotion
 
 With evaluation each epoch and push to Hub (after `huggingface-cli login`):
-  python fine_tune_transformers.py --epochs 2 --batch_size 64 --lr 2e-5 --eval_strategy epoch --push_to_hub --hub_model_id YOUR_USERNAME/distilbert-base-uncased-finetuned-emotion
+  python fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64 --lr 2e-5 --eval_strategy epoch --push_to_hub --hub_model_id YOUR_USERNAME/distilbert-base-uncased-finetuned-emotion
 """
 
 import argparse
