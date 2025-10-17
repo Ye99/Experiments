@@ -40,6 +40,7 @@ from transformers import (
     AutoConfig,
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
+    GenerationConfig,
     DataCollatorForSeq2Seq,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -353,6 +354,14 @@ def main() -> None:
         config=config,
         use_safetensors=True,
     )
+
+    try:
+        generation_cfg = GenerationConfig.from_pretrained(cfg.model_name_or_path)
+    except Exception:
+        generation_cfg = GenerationConfig.from_model_config(model.config)
+    generation_cfg.max_length = cfg.val_max_target_length
+    generation_cfg.num_beams = cfg.num_beams
+    model.generation_config = generation_cfg
 
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
