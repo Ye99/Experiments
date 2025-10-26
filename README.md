@@ -16,18 +16,19 @@ mamba install -n base -c conda-forge conda-lock
 
 ```bash
 cd path/to/repo
-conda-lock install --name finetune_transformer conda-lock.yml --mamba
-mamba activate finetune_transformer
+conda-lock install --name LLM_experiments conda-lock.yml --mamba
+mamba activate LLM_experiments
 ```
 
 Notes:
-- If you need to regenerate the lock (Linux x86_64): `conda-lock lock -f env.yml -p linux-64`
-- As a portable alternative (less exact), you can do:
+- Regenerate lockfile for both macOS arm64 and Linux x86_64:
+  `conda-lock lock -f env.yml --platform osx-arm64 --platform linux-64`
+- As a fallback alternative (but less exact), you can restore environment:
 
-```bash
-mamba env create -f env.yml -n finetune_transformer --channel-priority strict
-mamba activate finetune_transformer
-```
+  ```bash
+  mamba env create -f env.yml -n LLM_experiments
+  mamba activate LLM_experiments
+  ```
 
 ## Quick verification
 
@@ -108,6 +109,49 @@ Torchrun alternative (multi-GPU):
 ```bash
 torchrun --nproc_per_node=2 fine_tune_encoder_decoder_for_custom_summarization.py ...
 ```
+
+## Experiment 3, distill a model
+
+Plain (single process):
+
+```bash
+python distill_a_model.py \
+  --dataset_name glue --dataset_config sst2 \
+  --teacher_model_name bert-base-uncased \
+  --student_model_name distilbert-base-uncased \
+  --output_dir ./distilled-sst2
+```
+
+Accelerate (single or multi-GPU):
+
+```bash
+accelerate launch distill_a_model.py \
+  --dataset_name glue --dataset_config sst2 \
+  --teacher_model_name bert-base-uncased \
+  --student_model_name distilbert-base-uncased \
+  --output_dir ./distilled-sst2
+```
+
+Evaluate distilled model:
+
+```bash
+python evaluate_distilled_model.py \
+  --model_path ./distilled-sst2 \
+  --dataset_name glue --dataset_config sst2 \
+  --split validation --batch_size 64
+```
+Outputs a JSON report with accuracy, latency, throughput, parameter counts, and model size.
+
+Compare teacher vs student:
+
+```bash
+python evaluate_distilled_model.py \
+  --teacher_path bert-base-uncased \
+  --student_path ./distilled-sst2 \
+  --dataset_name glue --dataset_config sst2 \
+  --split validation --batch_size 64
+```
+Prints a JSON object with per-model metrics and deltas (speedup, latency reduction, size reduction, accuracy delta).
 
 Notes:
 - Tokenization runs on CPU. For faster preprocessing, add `num_proc=$(nproc)` to `Dataset.map` in the script.
