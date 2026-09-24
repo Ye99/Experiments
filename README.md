@@ -85,7 +85,6 @@ loss = alpha_ce   * KL( softmax(teacher_logits / T) || softmax(student_logits / 
 
 - The temperature `T` (`--temperature`, default 2) softens both distributions, so the student learns how confident the teacher is, not just its top answer. `T²` keeps this loss on the same gradient scale as the hard loss.
 - `--alpha_ce` / `--alpha_hard` (default 0.5 / 0.5) weight the two terms.
-- The teacher **must already be fine-tuned on the task**. Plain `bert-base-uncased` has a random classification head and scores 49% on SST-2 (chance), so it would teach noise.
 - The script evaluates every `--eval_steps` and at the end of each epoch, and keeps only the best student (by validation accuracy) in `--output_dir`.
 
 ```bash
