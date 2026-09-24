@@ -267,9 +267,11 @@ def build_compute_metrics(tokenizer: AutoTokenizer):
         predictions, labels = eval_pred
         if isinstance(predictions, tuple):
             predictions = predictions[0]
-        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        # Replace negative/pad ids to avoid decode overflow and ensure integer dtype
+        pred_ids = np.where(predictions < 0, tokenizer.pad_token_id, predictions).astype(np.int64)
+        decoded_preds = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id).astype(np.int64)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
         decoded_preds = ["\n".join(split_into_sentences(pred.strip())) for pred in decoded_preds]
