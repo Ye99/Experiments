@@ -43,7 +43,8 @@ from transformers import (
 
 DEFAULT_DATASET: str = "glue"
 DEFAULT_DATASET_CONFIG: str = "sst2"
-DEFAULT_TEACHER: str = "bert-base-uncased"
+# Must already be fine-tuned on the task: a bare "bert-base-uncased" has a random head
+DEFAULT_TEACHER: str = "yoshitomo-matsubara/bert-base-uncased-sst2"
 DEFAULT_STUDENT: str = "distilbert-base-uncased"
 DEFAULT_MAX_LENGTH: int = 128
 DEFAULT_BATCH_SIZE: int = 32
@@ -56,7 +57,6 @@ DEFAULT_ALPHA_CE: float = 0.5
 DEFAULT_ALPHA_HARD: float = 0.5
 DEFAULT_GRAD_CLIP_NORM: float = 1.0
 DEFAULT_EVAL_STEPS: int = 500
-DEFAULT_SAVE_TOTAL_LIMIT: int = 1
 
 
 @dataclass
@@ -77,7 +77,6 @@ class TrainConfig:
     alpha_hard: float
     grad_clip_norm: float
     eval_steps: int
-    save_total_limit: int
     seed: int
     fp16: bool
 
@@ -103,7 +102,6 @@ def parse_args(argv: Optional[List[str]] = None) -> TrainConfig:
     parser.add_argument("--alpha_hard", type=float, default=DEFAULT_ALPHA_HARD)
     parser.add_argument("--grad_clip_norm", type=float, default=DEFAULT_GRAD_CLIP_NORM)
     parser.add_argument("--eval_steps", type=int, default=DEFAULT_EVAL_STEPS)
-    parser.add_argument("--save_total_limit", type=int, default=DEFAULT_SAVE_TOTAL_LIMIT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", action="store_true")
 
@@ -125,7 +123,6 @@ def parse_args(argv: Optional[List[str]] = None) -> TrainConfig:
         alpha_hard=args.alpha_hard,
         grad_clip_norm=args.grad_clip_norm,
         eval_steps=args.eval_steps,
-        save_total_limit=args.save_total_limit,
         seed=args.seed,
         fp16=args.fp16,
     )
@@ -149,37 +146,21 @@ def load_and_tokenize(
     dataset_config: str,
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
-) -> Tuple[Dict[str, int], object, object, object]:
+) -> Tuple[int, object, object]:
     dataset = load_dataset(dataset_name, dataset_config)
+    column_names = dataset["train"].column_names
+    text_col = next((c for c in ("sentence", "sentence1", "text") if c in column_names), column_names[0])
 
     def tokenize_batch(batch: Dict[str, List[str]]) -> Dict[str, List[List[int]]]:
-        return tokenizer(batch["sentence"], truncation=True, max_length=max_length)
+        return tokenizer(batch[text_col], truncation=True, max_length=max_length)
 
-    column_names = dataset["train"].column_names
     remove_cols = [c for c in column_names if c != "label"]
-    if "sentence" not in column_names:
-        # Fallback for datasets with different text column names
-        text_col = "sentence" if "sentence" in column_names else (
-            "sentence1" if "sentence1" in column_names else (
-                "text" if "text" in column_names else column_names[0]
-            )
-        )
-
-        def tokenize_generic(batch: Dict[str, List[str]]) -> Dict[str, List[List[int]]]:
-            return tokenizer(batch[text_col], truncation=True, max_length=max_length)
-
-        tokenized = dataset.map(tokenize_generic, batched=True, remove_columns=remove_cols)
-    else:
-        tokenized = dataset.map(tokenize_batch, batched=True, remove_columns=remove_cols)
-
+    tokenized = dataset.map(tokenize_batch, batched=True, remove_columns=remove_cols)
     tokenized = tokenized.rename_column("label", "labels")
-    format_cols = ["input_ids", "attention_mask", "labels"]
-    if "token_type_ids" in tokenized["train"].column_names:
-        format_cols.insert(1, "token_type_ids")
-    tokenized.set_format(type="torch", columns=format_cols)
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
-    label2id = {"negative": 0, "positive": 1}
-    return label2id, tokenized["train"], tokenized["validation"], tokenized.get("test", None)
+    num_labels = dataset["train"].features["label"].num_classes
+    return num_labels, tokenized["train"], tokenized["validation"]
 
 
 def build_dataloaders(
@@ -269,8 +250,17 @@ def train(
     ce_criterion = torch.nn.CrossEntropyLoss()
 
     best_eval_acc = -1.0
-    best_dir = cfg.output_dir
-    best_dir.mkdir(parents=True, exist_ok=True)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    student_tokenizer = AutoTokenizer.from_pretrained(cfg.student_model_name)
+
+    def evaluate_and_save_best() -> Tuple[float, float]:
+        nonlocal best_eval_acc
+        eval_loss, eval_acc = evaluate(student, eval_loader, device)
+        if eval_acc > best_eval_acc:
+            best_eval_acc = eval_acc
+            student.save_pretrained(cfg.output_dir)
+            student_tokenizer.save_pretrained(cfg.output_dir)
+        return eval_loss, eval_acc
 
     global_step = 0
     for epoch in range(cfg.num_train_epochs):
@@ -326,38 +316,15 @@ def train(
             global_step += 1
 
             if cfg.eval_steps > 0 and (global_step % cfg.eval_steps == 0):
-                eval_loss, eval_acc = evaluate(student, eval_loader, device)
+                eval_loss, eval_acc = evaluate_and_save_best()
+                student.train()  # evaluate() switched to eval mode; re-enable dropout
                 pbar.set_postfix({
                     "train_loss": f"{running_loss / max(1, step+1):.4f}",
                     "eval_loss": f"{eval_loss:.4f}",
                     "eval_acc": f"{eval_acc:.4f}",
                 })
 
-                if eval_acc > best_eval_acc:
-                    best_eval_acc = eval_acc
-                    save_dir = best_dir
-                    # Clear older checkpoints if limit is 1
-                    for child in save_dir.iterdir():
-                        if child.is_dir():
-                            for f in child.iterdir():
-                                f.unlink()
-                            child.rmdir()
-                    student.save_pretrained(save_dir)
-                    tokenizer_name = cfg.student_model_name
-                    AutoTokenizer.from_pretrained(tokenizer_name).save_pretrained(save_dir)
-
-        # Epoch end evaluation
-        eval_loss, eval_acc = evaluate(student, eval_loader, device)
-        if eval_acc > best_eval_acc:
-            best_eval_acc = eval_acc
-            save_dir = best_dir
-            for child in save_dir.iterdir():
-                if child.is_dir():
-                    for f in child.iterdir():
-                        f.unlink()
-                    child.rmdir()
-            student.save_pretrained(save_dir)
-            AutoTokenizer.from_pretrained(cfg.student_model_name).save_pretrained(save_dir)
+        evaluate_and_save_best()
 
     print(f"Best validation accuracy: {best_eval_acc:.4f}")
 
@@ -379,18 +346,17 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # Prepare tokenizer and data
     tokenizer = prepare_tokenizer(cfg.teacher_model_name)
-    label2id, train_ds, val_ds, _ = load_and_tokenize(
+    num_labels, train_ds, val_ds = load_and_tokenize(
         cfg.dataset_name, cfg.dataset_config, tokenizer, cfg.max_length
     )
     train_loader, eval_loader = build_dataloaders(train_ds, val_ds, tokenizer, cfg.batch_size)
 
     # Load models
     teacher, student = load_models(
-        cfg.teacher_model_name, cfg.student_model_name, num_labels=len(label2id), device=device
+        cfg.teacher_model_name, cfg.student_model_name, num_labels=num_labels, device=device
     )
 
     # Train and save best
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     train(cfg, teacher, student, train_loader, eval_loader, device)
     print(f"Distilled model saved to: {cfg.output_dir}")
 

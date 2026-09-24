@@ -1,188 +1,113 @@
-# Experiments: Fine-Tuning and Distilling Transformers
+# Experiments: NLP with Transformers, plus multi-GPU training
 
-Standalone Python scripts that turn notebooks from
-[*Natural Language Processing with Transformers*](https://github.com/nlp-with-transformers/notebooks)
-into runnable, multi-GPU-friendly experiments with Hugging Face `transformers`.
+Standalone scripts for three topics from
+[*Natural Language Processing with Transformers*](https://github.com/nlp-with-transformers/notebooks) (fine-tuning, summarization, knowledge distillation), plus experiments with multi-GPU training using Hugging Face Accelerate.
 
-| # | Script | What it does | Default model / data |
+| # | Script | What it does | Defaults |
 |---|---|---|---|
-| 1 | `fine_tune_encoder_for_emotion_classification.py` | Fine-tunes an encoder for 6-class emotion classification (ch. 2) | `distilbert-base-uncased` on `emotion` |
-| 2 | `fine_tune_encoder_decoder_for_custom_summarization.py` | Fine-tunes an encoder-decoder for abstractive summarization, scored with ROUGE (ch. 6) | `sshleifer/distilbart-cnn-12-6` on `cnn_dailymail` 3.0.0 |
-| 3 | `distill_a_model.py` | Knowledge distillation: trains a small student to copy a larger teacher (ch. 8) | teacher `bert-base-uncased` → student `distilbert-base-uncased` on GLUE SST-2 |
-| 3 | `evaluate_distilled_model.py` | Measures accuracy, latency, throughput, parameters and disk size; compares teacher vs student | GLUE SST-2 validation |
-| – | `check_torch.py` | Environment sanity check (PyTorch version, CUDA/MPS, a test matmul) | – |
+| 1 | `fine_tune_encoder_for_emotion_classification.py` | Fine-tunes an encoder for 6-class emotion classification (book ch. 2) | `distilbert-base-uncased` on `emotion` |
+| 2 | `fine_tune_encoder_decoder_for_custom_summarization.py` | Fine-tunes an encoder-decoder for summarization, scored with ROUGE (ch. 6) | `sshleifer/distilbart-cnn-12-6` on `cnn_dailymail` 3.0.0 |
+| 3 | `distill_a_model.py` | Distills a large teacher into a smaller student (ch. 8) | `yoshitomo-matsubara/bert-base-uncased-sst2` → `distilbert-base-uncased` on GLUE SST-2 |
+| 3 | `evaluate_distilled_model.py` | Measures accuracy, speed, size and GPU memory; compares teacher vs student | SST-2 validation |
 
-## Set up environment
+## Setup
 
-We use mamba and conda-lock to reproduce the environment exactly (Linux x86_64 and macOS arm64).
-
-1) Ensure mamba and conda-lock
+The environment is pinned with conda-lock (Linux x86_64 and macOS arm64):
 
 ```bash
 mamba install -n base -c conda-forge conda-lock
-```
-
-2) Create the environment from the lockfile
-
-```bash
-cd path/to/repo
 conda-lock install --name LLM_experiments conda-lock.yml --mamba
 mamba activate LLM_experiments
+python check_torch.py   # prints torch version and device, runs a test matmul
 ```
 
-Notes:
-- Regenerate the lockfile for both platforms:
-  `conda-lock lock -f env.yml --platform osx-arm64 --platform linux-64`
-- Fallback (less exact): create the environment from `env.yml`:
-
-  ```bash
-  mamba env create -f env.yml -n LLM_experiments
-  mamba activate LLM_experiments
-  ```
-
-## Quick verification
-
-```bash
-python check_torch.py
-```
-
-Prints the PyTorch and Python versions, whether CUDA or MPS is available, the selected device, and runs a 1024×1024 matmul on it.
+- Without conda-lock (less exact): `mamba env create -f env.yml -n LLM_experiments`.
+- To regenerate the lockfile: `conda-lock lock -f env.yml --platform osx-arm64 --platform linux-64`.
+- The lock pins PyTorch 2.5.1. Recent `transformers` refuses to load `.bin`-only checkpoints on PyTorch < 2.6, so use models that ship `model.safetensors`. All the defaults here do.
 
 ## Experiment 1: fine-tune an encoder for emotion classification
 
-Loads the `emotion` dataset, tokenizes it, fine-tunes a sequence-classification head with `Trainer`, and reports accuracy and weighted F1.
-
-Plain Trainer (uses multiple GPUs via DataParallel if visible):
+Fine-tunes a classification head with `Trainer` and reports accuracy and weighted F1.
 
 ```bash
-python fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64
+python fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64                                  # DataParallel if >1 GPU visible
+accelerate launch --multi_gpu fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64           # DDP (recommended)
+CUDA_VISIBLE_DEVICES=0 python fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64           # single GPU
 ```
 
-Accelerate (recommended, DDP):
+- Mixed precision is picked automatically on CUDA (bf16 if supported, else fp16). Override it with `--fp16` / `--bf16`.
+- The model is saved to `<model>-finetuned-emotion/`. Add `--push_to_hub --hub_model_id <user>/<name>` to upload it.
 
-```bash
-accelerate launch --multi_gpu fine_tune_encoder_for_emotion_classification.py --epochs 2 --batch_size 64
-```
+### DataParallel vs DDP (2× RTX 4060 Ti, CUDA 12.4, batch_size=64, 1 epoch)
 
-Tips:
-- Force a specific GPU: `CUDA_VISIBLE_DEVICES=0 python fine_tune_encoder_for_emotion_classification.py ...`
-- Mixed precision is auto-selected on CUDA (bf16 if supported, else fp16) and disabled on CPU. Override with `--fp16` / `--bf16`.
-- Outputs are saved under `<model>-finetuned-emotion/` (ignored by `.gitignore`), including `label_names.json`.
-- Push to the Hub with `--push_to_hub --hub_model_id YOUR_USERNAME/<name>` (after `huggingface-cli login`).
-
-### Performance comparison (2× RTX 4060 Ti, CUDA 12.4, batch_size=64, 1 epoch)
-
-| Mode | Command | Train runtime | Steps/s | Samples/s |
+| Mode | Launch | Train runtime | Steps/s | Samples/s |
 |---|---|---:|---:|---:|
-| DataParallel (Trainer, plain `python`) | `python fine_tune_encoder_for_emotion_classification.py --epochs 1 --batch_size 64` | ~29.74 s | ~4.20 | ~538 |
-| DDP (Accelerate) | `accelerate launch --multi_gpu fine_tune_encoder_for_emotion_classification.py --epochs 1 --batch_size 64` | ~16.26 s | ~7.69 | ~984 |
+| DataParallel | `python …` | ~29.7 s | ~4.2 | ~538 |
+| DDP | `accelerate launch --multi_gpu …` | ~16.3 s | ~7.7 | ~984 |
 
-- Speedup (DDP vs DP): ~1.8× on this setup.
-
-### Reproducibility
-
-- Seed is set via `--seed` (defaults to 42).
-- For larger global batch sizes (GPUs × per-device batch × grad_accum), consider LR scaling.
+DDP is ~1.8× faster. DataParallel runs one process that funnels every step through GPU 0. DDP runs one process per GPU and averages gradients directly between GPUs.
 
 ## Experiment 2: fine-tune an encoder-decoder for summarization
 
-Fine-tunes a seq2seq model with `Seq2SeqTrainer`. Evaluation generates summaries with beam search (`--num_beams`) and scores them with ROUGE-1/2/L/Lsum. The defaults use CNN/DailyMail. To use your own data (e.g. customer-support conversations), point `--dataset_name` / `--dataset_config` at any Hub dataset and set `--text_column` / `--summary_column`. Use `--max_train_samples` / `--max_eval_samples` for quick runs.
-
-Plain Trainer (single GPU, or DataParallel if multiple GPUs are visible):
+Fine-tunes a seq2seq model with `Seq2SeqTrainer`. It evaluates by generating summaries with beam search and scoring them with ROUGE-1/2/L/Lsum. The defaults are listed in the table above (batch 4 per GPU, lr 3e-5, 3 epochs, fp16, 4 beams).
 
 ```bash
-python fine_tune_encoder_decoder_for_custom_summarization.py \
-  --model_name_or_path sshleifer/distilbart-cnn-12-6 \
-  --dataset_name cnn_dailymail --dataset_config 3.0.0 \
-  --text_column article --summary_column highlights \
-  --output_dir ./summarization-model \
-  --per_device_train_batch_size 4 --per_device_eval_batch_size 4 \
-  --learning_rate 3e-5 --num_train_epochs 3 \
-  --gradient_accumulation_steps 1 --fp16 true --num_beams 4
+python fine_tune_encoder_decoder_for_custom_summarization.py                            # DataParallel if >1 GPU visible
+accelerate launch --multi_gpu fine_tune_encoder_decoder_for_custom_summarization.py     # DDP (recommended)
+torchrun --nproc_per_node=2 fine_tune_encoder_decoder_for_custom_summarization.py       # DDP without Accelerate
 ```
 
-Accelerate (recommended, DDP, multi-GPU):
+To use other data, set the dataset and its columns. Pass `--dataset_config ""` if the dataset has no config (the default is CNN/DailyMail's `3.0.0`). For example, dialogue summarization:
 
 ```bash
 accelerate launch --multi_gpu fine_tune_encoder_decoder_for_custom_summarization.py \
-  --model_name_or_path sshleifer/distilbart-cnn-12-6 \
-  --dataset_name cnn_dailymail --dataset_config 3.0.0 \
-  --text_column article --summary_column highlights \
-  --output_dir ./summarization-model \
-  --per_device_train_batch_size 4 --per_device_eval_batch_size 4 \
-  --learning_rate 3e-5 --num_train_epochs 3 \
-  --gradient_accumulation_steps 1 --fp16 true --num_beams 4
+  --dataset_name knkarthick/dialogsum --dataset_config "" --text_column dialogue --summary_column summary
 ```
 
-Torchrun alternative (multi-GPU):
+For a quick run, add `--max_train_samples 400 --max_eval_samples 40 --max_predict_samples 40`.
 
-```bash
-torchrun --nproc_per_node=2 fine_tune_encoder_decoder_for_custom_summarization.py ...
-```
-
-Result from a run with the settings above (validation set, step 12,000 ≈ 1/3 epoch):
+Result on the validation set, from DDP on 2 GPUs with `--num_train_epochs 1`, at step 12,000 of 35,890:
 
 | ROUGE-1 | ROUGE-2 | ROUGE-L | ROUGE-Lsum | eval loss |
 |---:|---:|---:|---:|---:|
 | 44.51 | 21.31 | 30.54 | 41.78 | 1.678 |
 
-Notes:
-- Model weights are loaded with safetensors (`use_safetensors=True`). Prefer models that ship safetensors weights (most BART/T5 repos do). If you only have `.bin` weights, re-download safetensors from the Hub or upgrade PyTorch to >= 2.6.
-- Tokenization runs on CPU. For faster preprocessing, add `num_proc=$(nproc)` to `Dataset.map` in the script.
-- Outputs and logs are written under `--output_dir` (e.g., `./summarization-model`).
+`distilbart-cnn-12-6` is already fine-tuned on CNN/DailyMail, and these scores match its [model card](https://huggingface.co/sshleifer/distilbart-cnn-12-6) (ROUGE-2 21.26, ROUGE-L 30.59). So the default run mainly checks that the pipeline works. The real use is fine-tuning on your own data.
 
 ## Experiment 3: distill a model
 
-`distill_a_model.py` is a plain PyTorch training loop. On each batch the frozen teacher and the student both predict, and the student is trained on a mix of two losses:
+Distillation trains a small **student** to imitate a large, already fine-tuned **teacher**. The goal is a model that is much smaller and faster but nearly as accurate. On each batch, the frozen teacher and the student both predict, and the student learns from a mix of two losses:
 
 ```
-loss = alpha_ce   * KL( softmax(teacher_logits / T) || softmax(student_logits / T) ) * T²   # match the teacher
-     + alpha_hard * CrossEntropy(student_logits, labels)                                   # match the true labels
+loss = alpha_ce   * KL( softmax(teacher_logits / T) || softmax(student_logits / T) ) * T²   # imitate the teacher
+     + alpha_hard * CrossEntropy(student_logits, labels)                                   # fit the true labels
 ```
 
-- The temperature `T` (`--temperature`, default 2.0) softens both distributions, so the student also learns how confident the teacher is, not just its top answer.
-- The `T²` factor keeps the soft loss on the same gradient scale as the hard loss.
+- The temperature `T` (`--temperature`, default 2) softens both distributions, so the student learns how confident the teacher is, not just its top answer. `T²` keeps this loss on the same gradient scale as the hard loss.
 - `--alpha_ce` / `--alpha_hard` (default 0.5 / 0.5) weight the two terms.
-- It uses AdamW with linear warmup/decay, gradient clipping, and optional mixed precision (`--fp16`). It evaluates every `--eval_steps` and at the end of each epoch, and saves only the best checkpoint (by validation accuracy) to `--output_dir`.
-
-**Use a teacher that is already fine-tuned on the task.** The default `bert-base-uncased` has a randomly initialized classification head, so it can't teach anything. Pass an SST-2 fine-tuned BERT (uncased) instead, for example:
-
-```bash
-python distill_a_model.py \
-  --dataset_name glue --dataset_config sst2 \
-  --teacher_model_name yoshitomo-matsubara/bert-base-uncased-sst2 \
-  --student_model_name distilbert-base-uncased \
-  --output_dir ./distilled-sst2 --fp16
-```
-
-The script runs on a single device (CUDA, MPS, or CPU). It doesn't use Accelerate/DDP, so don't launch it with `--multi_gpu`: that would start independent copies that all write to the same `--output_dir`.
-
-### Evaluate
-
-Single model:
+- The teacher **must already be fine-tuned on the task**. Plain `bert-base-uncased` has a random classification head and scores 49% on SST-2 (chance), so it would teach noise.
+- The script evaluates every `--eval_steps` and at the end of each epoch, and keeps only the best student (by validation accuracy) in `--output_dir`.
 
 ```bash
-python evaluate_distilled_model.py \
-  --model_path ./distilled-sst2 \
-  --dataset_name glue --dataset_config sst2 \
-  --split validation --batch_size 64
-```
-
-Prints JSON with loss, accuracy, samples/s, average latency, total/trainable parameters, disk and weight-file sizes, and peak CUDA memory.
-
-Compare teacher vs student:
-
-```bash
+python distill_a_model.py --fp16                                    # distill into ./distilled-sst2
+python evaluate_distilled_model.py --model_path ./distilled-sst2    # one model
 python evaluate_distilled_model.py \
   --teacher_path yoshitomo-matsubara/bert-base-uncased-sst2 \
-  --student_path ./distilled-sst2 \
-  --dataset_name glue --dataset_config sst2 \
-  --split validation --batch_size 64
+  --student_path ./distilled-sst2                                   # teacher vs student, with speedup and size reduction
 ```
 
-Prints both models' metrics plus `speedup_samples_per_s`, `latency_reduction`, `size_reduction`, and `accuracy_delta`. Use `--split validation`: GLUE's SST-2 test labels are hidden (all `-1`).
+`distill_a_model.py` runs on a single device (CUDA, MPS or CPU). It doesn't use DDP, so don't launch it with `accelerate launch --multi_gpu`: that would start independent copies that all write to the same `--output_dir`.
 
-### Limitations
+### Results (one RTX 4060 Ti, default settings: 3 epochs, batch 32, T=2, α=0.5/0.5)
 
-- The data is tokenized with the **teacher's** tokenizer and fed to both models, so teacher and student must share a vocabulary (e.g. BERT-uncased → DistilBERT-uncased).
-- Labels are fixed to binary `negative`/`positive`. Other `--dataset_name` values only work for binary single-sentence tasks.
+Accuracy is on the 872-sentence SST-2 validation set. Speed is inference throughput at batch 64 in fp32, after a warm-up pass.
+
+| Model | Layers | Params | Size on disk | Peak GPU memory | Throughput | Accuracy |
+|---|---:|---:|---:|---:|---:|---:|
+| Teacher (BERT-base) | 12 | 109.5 M | 418 MiB | 543 MiB | ~1,080 samples/s | 92.55% |
+| Distilled student (DistilBERT) | 6 | 67.0 M | 256 MiB | 380 MiB | ~2,050 samples/s | 91.63% |
+| **Student vs teacher** | **½** | **−39%** | **−39%** | **−30%** | **1.9× faster** | **−0.9 pt (keeps 99%)** |
+
+The cost is paid once, during training. Every step also runs the teacher, so distillation trains at ~16 steps/s against ~26 for the student alone (3 epochs took ~7 min).
+
+Limitation: the data is tokenized with the teacher's tokenizer and fed to both models, so teacher and student must share a vocabulary (e.g. BERT-uncased → DistilBERT-uncased).

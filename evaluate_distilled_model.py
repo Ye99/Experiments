@@ -37,7 +37,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dataset_config", type=str, default="sst2")
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--split", type=str, default="validation", choices=["train", "validation", "test"])
+    # GLUE test labels are hidden (-1), so only labeled splits can be scored
+    parser.add_argument("--split", type=str, default="validation", choices=["train", "validation"])
     return parser.parse_args(argv)
 
 
@@ -49,36 +50,21 @@ def prepare_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 def load_and_tokenize(
     dataset_name: str,
     dataset_config: str,
+    split: str,
     tokenizer: PreTrainedTokenizerBase,
     max_length: int,
-) -> Dict[str, object]:
-    dataset = load_dataset(dataset_name, dataset_config)
+) -> object:
+    dataset = load_dataset(dataset_name, dataset_config, split=split)
+    column_names = dataset.column_names
+    text_col = next((c for c in ("sentence", "sentence1", "text") if c in column_names), column_names[0])
 
     def tokenize_batch(batch: Dict[str, List[str]]) -> Dict[str, List[List[int]]]:
-        return tokenizer(batch["sentence"], truncation=True, max_length=max_length)
+        return tokenizer(batch[text_col], truncation=True, max_length=max_length)
 
-    column_names = dataset["train"].column_names
     remove_cols = [c for c in column_names if c != "label"]
-
-    if "sentence" not in column_names:
-        text_col = "sentence" if "sentence" in column_names else (
-            "sentence1" if "sentence1" in column_names else (
-                "text" if "text" in column_names else column_names[0]
-            )
-        )
-
-        def tokenize_generic(batch: Dict[str, List[str]]) -> Dict[str, List[List[int]]]:
-            return tokenizer(batch[text_col], truncation=True, max_length=max_length)
-
-        tokenized = dataset.map(tokenize_generic, batched=True, remove_columns=remove_cols)
-    else:
-        tokenized = dataset.map(tokenize_batch, batched=True, remove_columns=remove_cols)
-
+    tokenized = dataset.map(tokenize_batch, batched=True, remove_columns=remove_cols)
     tokenized = tokenized.rename_column("label", "labels")
-    format_cols = ["input_ids", "attention_mask", "labels"]
-    if "token_type_ids" in tokenized["train"].column_names:
-        format_cols.insert(1, "token_type_ids")
-    tokenized.set_format(type="torch", columns=format_cols)
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     return tokenized
 
 
@@ -116,6 +102,13 @@ def evaluate(
     avg_loss = total_loss / max(1, num_total)
     accuracy = num_correct / max(1, num_total)
     return avg_loss, accuracy
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def count_parameters(model: PreTrainedModel) -> Tuple[int, int]:
@@ -193,8 +186,7 @@ def _evaluate_one(
     batch_size: int,
     device: torch.device,
 ) -> Dict[str, object]:
-    tokenized = load_and_tokenize(dataset_name, dataset_config, tokenizer, max_length)
-    dataset_split = tokenized[split]
+    dataset_split = load_and_tokenize(dataset_name, dataset_config, split, tokenizer, max_length)
     eval_loader = build_dataloader(dataset_split, tokenizer, batch_size)
 
     model = AutoModelForSequenceClassification.from_pretrained(model_path)
@@ -204,8 +196,13 @@ def _evaluate_one(
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    # Untimed warm-up pass so one-time GPU setup (kernel loading, cuBLAS init) is
+    # not charged to whichever model happens to be evaluated first
+    evaluate(model, eval_loader, device)
+    _synchronize(device)
     start = time.perf_counter()
     eval_loss, eval_acc = evaluate(model, eval_loader, device)
+    _synchronize(device)
     elapsed_s = time.perf_counter() - start
     num_samples = len(eval_loader.dataset)
     samples_per_s = float(num_samples) / elapsed_s if elapsed_s > 0 else 0.0

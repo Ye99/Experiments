@@ -206,7 +206,7 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
         train_dataset=encoded["train"],
         eval_dataset=encoded.get("validation", None),
